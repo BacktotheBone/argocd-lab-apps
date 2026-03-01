@@ -1,0 +1,184 @@
+name: promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: "frontend|backend|all"
+        required: true
+        default: "all"
+        type: choice
+        options: [all, frontend, backend]
+      from_env:
+        description: "dev|int"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev, int]
+      to_env:
+        description: "int|prod"
+        required: true
+        default: "int"
+        type: choice
+        options: [int, prod]
+
+  pull_request:
+    types: [closed]
+    branches: [main]
+    paths:
+      - "app-scm-examples/spike/deploy/frontend/values-prod.yaml"
+      - "app-scm-examples/spike/deploy/backend/values-prod.yaml"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  promote:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+      - name: Promote digest
+        env:
+          COMP: ${{ inputs.component }}
+          FROM: ${{ inputs.from_env }}
+          TO: ${{ inputs.to_env }}
+        run: |
+          set -euo pipefail
+
+          # --- anti-bypass ---
+          if [ "$FROM" = "dev" ] && [ "$TO" = "prod" ]; then
+            echo "ERROR: No se permite dev -> prod. Debe pasar por int."
+            exit 1
+          fi
+          if [ "$TO" = "prod" ] && [ "$FROM" != "int" ]; then
+            echo "ERROR: Para prod solo se permite int -> prod."
+            exit 1
+          fi
+
+          # --- componentes ---
+          if [ "$COMP" = "all" ]; then
+            COMPONENTS=("frontend" "backend")
+          elif [ "$COMP" = "frontend" ] || [ "$COMP" = "backend" ]; then
+            COMPONENTS=("$COMP")
+          else
+            echo "ERROR: component inválido: $COMP (usa frontend|backend|all)"
+            exit 1
+          fi
+
+          for C in "${COMPONENTS[@]}"; do
+            SRC="app-scm-examples/spike/deploy/${C}/values-${FROM}.yaml"
+            DST="app-scm-examples/spike/deploy/${C}/values-${TO}.yaml"
+
+            DIGEST="$(yq -r '.image.digest' "$SRC")"
+            if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+              echo "ERROR: digest vacío en $SRC"
+              exit 1
+            fi
+
+            echo "Promoting $C $FROM -> $TO digest=$DIGEST"
+            yq -i ".image.digest = \"$DIGEST\"" "$DST"
+          done
+
+          if git diff --quiet; then
+            echo "No changes to promote"
+            exit 0
+          fi
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.ORG_PR_ACTION }}
+          commit-message: "promote: ${{ inputs.component }} ${{ inputs.from_env }} -> ${{ inputs.to_env }}"
+          title: "Promote ${{ inputs.component }} ${{ inputs.from_env }} -> ${{ inputs.to_env }}"
+          body: "Promoción copiando .image.digest del entorno origen al destino."
+          branch: "promote/${{ inputs.component }}-${{ inputs.from_env }}-to-${{ inputs.to_env }}-${{ github.run_id }}"
+          delete-branch: true
+          labels: |
+            promote
+            to-${{ inputs.to_env }}
+
+  release_prod:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate (solo PRs de promote -> prod)
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PR_ACTION }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          labels="$(gh api repos/$REPO/issues/$PR --jq '[.labels[].name] | join(",")')"
+          echo "labels=$labels"
+
+          # Solo si tiene labels promote + to-prod
+          if echo "$labels" | grep -q "promote" && echo "$labels" | grep -q "to-prod"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install yq
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+      - name: Create tag + GitHub Release (PROD)
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PR_ACTION }}
+        run: |
+          set -euo pipefail
+
+          FE_DIGEST="$(yq -r '.image.digest' app-scm-examples/spike/deploy/frontend/values-prod.yaml)"
+          BE_DIGEST="$(yq -r '.image.digest' app-scm-examples/spike/deploy/backend/values-prod.yaml)"
+
+          if [ -z "$FE_DIGEST" ] || [ "$FE_DIGEST" = "null" ]; then
+            echo "ERROR: frontend prod digest vacío"
+            exit 1
+          fi
+          if [ -z "$BE_DIGEST" ] || [ "$BE_DIGEST" = "null" ]; then
+            echo "ERROR: backend prod digest vacío"
+            exit 1
+          fi
+
+          SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          TAG="prod-$(date -u +%Y%m%d-%H%M)-${SHORT_SHA}"
+
+          NOTES=$(cat <<EOF
+          
+          ## Release
+
+          **Commit:** ${GITHUB_SHA}
+
+          ### Digests desplegados
+          - Frontend: ${FE_DIGEST}
+          - Backend:  ${BE_DIGEST}
+
+          ### Rollback
+          Usa el workflow rollback con strategy=ref y ref=${TAG}
+          EOF
+          )
+
+          # crea tag+release en el commit actual de main
+          gh release create "$TAG" --title "PROD $TAG" --notes "$NOTES"
+          gh release view "$TAG" --json url,tagName,publishedAt
+          

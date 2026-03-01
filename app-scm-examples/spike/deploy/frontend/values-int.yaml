@@ -1,0 +1,21 @@
+app:
+  name: spike
+  env: int
+  component: frontend
+image:
+  repository: ghcr.io/BacktotheBone/argocd-lab-apps/spike/frontend
+  digest: "sha256:e88a1be88247d3e252e8a731e4bcd7bf147d5d047230955d0b4a5ea40b87f9eb"
+imagePullSecrets:
+  - name: ghcr-pull
+containerPort: 80
+service:
+  port: 80
+ingress:
+  enabled: true
+  className: traefik
+  host: int.spike.local
+  annotations: {}
+  paths:
+    - path: /
+      pathType: Prefix
+env: []

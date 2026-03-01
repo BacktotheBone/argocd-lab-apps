@@ -1,0 +1,24 @@
+app:
+  name: spike
+  env: dev
+  component: backend
+replicaCount: 1
+image:
+  repository: ghcr.io/BacktotheBone/argocd-lab-apps/spike/backend
+  digest: "sha256:fc0773f7e4b1aec633d86c8854cc5ef86dad820386e1df56a9454bfb0e616f62"
+imagePullSecrets:
+  - name: ghcr-pull
+containerPort: 8080
+service:
+  port: 80
+ingress:
+  enabled: true
+  className: traefik
+  host: dev.spike.local
+  annotations: {}
+  paths:
+    - path: /api
+      pathType: Prefix
+env:
+  - name: ASPNETCORE_URLS
+    value: "http://+:8080"

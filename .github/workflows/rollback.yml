@@ -1,0 +1,176 @@
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "dev|int|prod"
+        required: true
+        default: "int"
+        type: choice
+        options: [dev, int, prod]
+      component:
+        description: "frontend|backend|all"
+        required: true
+        default: "all"
+        type: choice
+        options: [all, frontend, backend]
+      strategy:
+        description: "previous = volver al digest anterior del fichero | ref = coger digest desde un ref (tag/sha) | digest = digest explícito"
+        required: true
+        default: "previous"
+        type: choice
+        options: [previous, ref, digest]
+      steps_back:
+        description: "Solo strategy=previous. 1 = valor anterior. 2 = dos cambios atrás..."
+        required: false
+        default: "1"
+      ref:
+        description: "Solo strategy=ref. Tag/sha (ej: prod-20260212-abc1234)"
+        required: false
+        default: ""
+      digest:
+        description: "Solo strategy=digest. Ej: sha256:.... (sin quotes)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install yq
+        run: |
+          curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+
+      - name: Compute target digest and update values files
+        env:
+          ENV: ${{ inputs.env }}
+          COMP: ${{ inputs.component }}
+          STRATEGY: ${{ inputs.strategy }}
+          STEPS_BACK: ${{ inputs.steps_back }}
+          REF: ${{ inputs.ref }}
+          DIGEST_IN: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # --- componentes ---
+          if [ "$COMP" = "all" ]; then
+            COMPONENTS=("frontend" "backend")
+          elif [ "$COMP" = "frontend" ] || [ "$COMP" = "backend" ]; then
+            COMPONENTS=("$COMP")
+          else
+            echo "ERROR: component inválido: $COMP"
+            exit 1
+          fi
+
+          # --- helper: extraer digest de un YAML por stdin ---
+          yq_digest() {
+            yq -r '.image.digest' -
+          }
+
+          # --- decide target digest por componente ---
+          for C in "${COMPONENTS[@]}"; do
+            FILE="app-scm-examples/spike/deploy/${C}/values-${ENV}.yaml"
+
+            if [ ! -f "$FILE" ]; then
+              echo "ERROR: no existe $FILE"
+              exit 1
+            fi
+
+            CUR="$(yq -r '.image.digest' "$FILE")"
+            echo "[$C/$ENV] current digest: $CUR"
+
+            TARGET=""
+
+            case "$STRATEGY" in
+              previous)
+                N="${STEPS_BACK:-1}"
+                if ! echo "$N" | grep -Eq '^[0-9]+$' ; then
+                  echo "ERROR: steps_back debe ser numérico"
+                  exit 1
+                fi
+
+                # commits que tocaron ESTE fichero (0 = último cambio del fichero, 1 = anterior, ...)
+                mapfile -t COMMITS < <(git log --format=%H -- "$FILE")
+
+                IDX="$N"
+                if [ "${#COMMITS[@]}" -le "$IDX" ]; then
+                  echo "ERROR: no hay suficientes cambios en historial para $FILE (steps_back=$N)."
+                  echo "Commits disponibles: ${#COMMITS[@]}"
+                  exit 1
+                fi
+
+                TARGET_COMMIT="${COMMITS[$IDX]}"
+                echo "[$C/$ENV] using commit=${TARGET_COMMIT} for previous value (steps_back=$N)"
+
+                TARGET="$(git show "${TARGET_COMMIT}:${FILE}" | yq_digest)"
+                ;;
+              ref)
+                if [ -z "${REF:-}" ]; then
+                  echo "ERROR: strategy=ref requiere inputs.ref"
+                  exit 1
+                fi
+                echo "[$C/$ENV] reading digest from ref=$REF"
+                TARGET="$(git show "${REF}:${FILE}" | yq_digest)"
+                ;;
+              digest)
+                if [ -z "${DIGEST_IN:-}" ]; then
+                  echo "ERROR: strategy=digest requiere inputs.digest"
+                  exit 1
+                fi
+                TARGET="$DIGEST_IN"
+                ;;
+              *)
+                echo "ERROR: strategy inválida: $STRATEGY"
+                exit 1
+                ;;
+            esac
+
+            if [ -z "$TARGET" ] || [ "$TARGET" = "null" ]; then
+              echo "ERROR: target digest vacío para $C/$ENV (strategy=$STRATEGY)"
+              exit 1
+            fi
+
+            if [ "$TARGET" = "$CUR" ]; then
+              echo "[$C/$ENV] target == current, no change"
+            else
+              echo "[$C/$ENV] setting digest -> $TARGET"
+              yq -i ".image.digest = \"$TARGET\"" "$FILE"
+            fi
+          done
+
+          if git diff --quiet; then
+            echo "No changes to rollback"
+            exit 0
+          fi
+
+          echo "Changes:"
+          git --no-pager diff
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.PR_ACTION }}
+          commit-message: "rollback: ${{ inputs.component }} ${{ inputs.env }} (${{ inputs.strategy }})"
+          title: "Rollback ${{ inputs.component }} en ${{ inputs.env }} (${{ inputs.strategy }})"
+          body: |
+            Rollback solicitado:
+            - env: `${{ inputs.env }}`
+            - component: `${{ inputs.component }}`
+            - strategy: `${{ inputs.strategy }}`
+            - steps_back: `${{ inputs.steps_back }}`
+            - ref: `${{ inputs.ref }}`
+            - digest: `${{ inputs.digest }}`
+            
+            Este PR actualiza `.image.digest` en `app-scm-examples/spike/deploy/*/values-${{ inputs.env }}.yaml`.
+          branch: "rollback/${{ inputs.component }}-${{ inputs.env }}-${{ github.run_id }}"
+          delete-branch: true
