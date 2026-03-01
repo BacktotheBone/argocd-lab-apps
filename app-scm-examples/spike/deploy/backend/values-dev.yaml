@@ -5,7 +5,7 @@ app:
 replicaCount: 1
 image:
   repository: ghcr.io/BacktotheBone/argocd-lab-apps/spike/backend
-  digest: "sha256:1d9f77b258e8b51eb7dbaa3dab423d2fecdf51c85b78ba22a3090d31416b95cb"
+  digest: "sha256:4827f33cdaf8a66c2cad7200244843efe5ca33986beff5a996090f87949ed7fd"
 imagePullSecrets:
   - name: ghcr-pull
 containerPort: 8080
