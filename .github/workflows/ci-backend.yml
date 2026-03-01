@@ -56,7 +56,21 @@ jobs:
       - name: Update deploy/backend/values-dev.yaml with digest
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          DIGEST="${{ steps.build.outputs.digest }}"
+          # Extract the image name from the tag (remove the :sha-* tag)
+          IMAGE_NAME=$(echo "${{ steps.meta.outputs.tags }}" | head -n1 | sed 's/@.*//' | sed 's/:[^:]*$//')
+          TAG_NAME=$(echo "${{ steps.meta.outputs.tags }}" | head -n1 | grep -o '[^:]*$')
+          echo "Querying digest for: $IMAGE_NAME:$TAG_NAME"
+          
+          # Query the GHCR registry API for the image digest (multi-arch manifest)
+          DIGEST=$(curl -s -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+            "https://ghcr.io/v2/$IMAGE_NAME/manifests/$TAG_NAME" \
+            -H "Authorization: Bearer $(echo -n "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64)" | jq -r '.config.digest // .manifests[0].digest' 2>/dev/null)
+          
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+            echo "Error: Could not retrieve digest from registry"
+            exit 1
+          fi
+          
           echo "Digest=$DIGEST"
           sudo apt-get update && sudo apt-get install -y jq
           curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
